@@ -1646,8 +1646,70 @@ def build_upstream_body(payload):
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
     return body
+class RateLimited(Exception):
+    """Upstream throttled this model (429 / code 6004). Distinct from a dead
+    pool: the credential is fine, only the model is cooling down for a while."""
+
+    def __init__(self, http_error=None, detail="", wait=60):
+        self.http_error = http_error
+        self.detail = detail or ""
+        self.wait = max(1, int(wait or 60))
+        super().__init__("upstream rate limit: %s" % (self.detail[:200] or "429"))
+
+
+def retry_after_seconds(model, realm):
+    """Shortest wait until any account of this realm can serve `model` again."""
+    if not POOL:
+        return 60
+    waits = [a.throttle_wait(model=model) for a in POOL.accounts
+             if a.realm == realm and a.enabled and a.access_token]
+    active = [w for w in waits if w > 0]
+    return int(min(active)) if active else 60
+
+
+def realm_model_throttled(realm, model):
+    """True when accounts exist and are healthy but all are cooling this model."""
+    if not POOL:
+        return (False, 0)
+    existing = [a for a in POOL.accounts
+                if a.realm == realm and a.enabled and a.access_token]
+    if not existing:
+        return (False, 0)
+    waits = [a.throttle_wait(model=model) for a in existing]
+    if waits and all(w > 0 for w in waits):
+        return (True, int(min(waits)))
+    return (False, 0)
+
+
+def parse_rate_limit_reset(detail):
+    """Pull the reset time out of an upstream 429 body, if it names one.
+
+    Upstream answers code 6004 with "... your usage will reset at
+    2026-09-19 18:29:03 UTC+8 ...". Returns an epoch or None. Kept tolerant on
+    purpose: an unparseable body must not break the request path.
+    """
+    if not detail:
+        return None
+    m = re.search(r"reset at\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", detail)
+    if not m:
+        return None
+    stamp = m.group(1).replace("T", " ")
+    tz = re.search(r"UTC([+-]\d{1,2})(?::?(\d{2}))?", detail)
+    offset = 0
+    if tz:
+        hours = int(tz.group(1))
+        minutes = int(tz.group(2) or 0)
+        offset = hours * 3600 + (minutes * 60 if hours >= 0 else -minutes * 60)
+    try:
+        base = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S")) - time.timezone
+        return base - offset
+    except Exception:
+        return None
+
+
 def open_upstream(payload, session_key=None, target_realm=None):
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
+    model = str(payload.get("model") or "")
     upstream_body = build_upstream_body(payload)
     body = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
@@ -1658,11 +1720,14 @@ def open_upstream(payload, session_key=None, target_realm=None):
         if session_key and AFFINITY_DEBUG:
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
-    total = max(1, POOL.count_ready(realm)) if POOL else 1
+    total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
     tried = set()
     last_error = None
+    last_429 = None
+    last_429_detail = ""
     for _ in range(total):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key, exclude=tried) if POOL else None
+        account = POOL.pick_for_session(realm=realm, session_key=session_key,
+                                        exclude=tried, model=model) if POOL else None
         if account is None:
             break
         if account.realm != realm:
@@ -1675,15 +1740,34 @@ def open_upstream(payload, session_key=None, target_realm=None):
                                      headers=account.headers(purpose="chat"))
         try:
             resp = urllib.request.urlopen(req, timeout=600)
-            account.clear_error()
+            account.clear_error(model=model)
             return resp, account
         except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403, 429):
+            if exc.code == 429:
+                try:
+                    detail = exc.read(600).decode("utf-8", "replace")
+                except Exception:
+                    detail = ""
+                reset_at = parse_rate_limit_reset(detail)
+                wait = max(1.0, reset_at - time.time()) if reset_at else 60.0
+                # Model-scoped: only this model is throttled for this account,
+                # so sibling models stay serviceable on the same credential.
+                account.note_error("HTTP 429 (model throttled)", model=model, until=reset_at,
+                                   cooldown=wait)
+                log("account %s throttled on '%s' (429), retry in %ds"
+                    % (account.uid[:8], model, int(wait)))
+                if session_key and POOL:
+                    POOL.affinity.unbind(session_key)
+                last_error = exc
+                last_429 = exc
+                last_429_detail = detail
+                continue
+            if exc.code in (401, 403):
                 log("account %s rejected (HTTP %s), rotating" % (account.uid[:8], exc.code))
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
                 account.note_error("HTTP %s" % exc.code,
-                                   cooldown=300 if exc.code == 429 else 60,
+                                   cooldown=60,
                                    single_account=(total <= 1))
                 last_error = exc
                 continue
@@ -1695,7 +1779,13 @@ def open_upstream(payload, session_key=None, target_realm=None):
             last_error = exc
             continue
     if last_error is not None:
+        if last_429 is not None:
+            raise RateLimited(last_429, last_429_detail,
+                              wait=retry_after_seconds(model, realm))
         raise last_error
+    throttled, wait = realm_model_throttled(realm, model)
+    if throttled:
+        raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
     raise RuntimeError(f"no usable account for realm '{realm}': all are disabled, cooling down, or expired")
 def extract_session_key(headers, payload):
     key = (
@@ -2662,6 +2752,30 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
     def _error(self, code, message, err_type="server_error"):
         self._json(code, {"error": {"message": message, "type": err_type, "code": code}})
+    def _rate_limited(self, exc):
+        """429 with Retry-After, so clients back off instead of hammering.
+
+        The upstream body names the reset time; when it does not, fall back to
+        the shortest model cooldown we know about.
+        """
+        wait = max(1, int(getattr(exc, "wait", 60) or 60))
+        body = json.dumps({
+            "error": {
+                "message": ("upstream rate limit reached for this model; retry in %ds"
+                            % wait) + ((" - " + exc.detail[:200]) if exc.detail else ""),
+                "type": "rate_limit_error",
+                "code": 429,
+                "retry_after": wait,
+            }
+        }, ensure_ascii=False).encode("utf-8")
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Retry-After", str(wait))
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
     def _download(self, filename, obj):
         """Send a JSON document as a browser download.
         Content-Disposition is quoted because the filename is generated from
@@ -3494,6 +3608,10 @@ class Handler(BaseHTTPRequestHandler):
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account = open_upstream(chat_req, session_key=session_key, target_realm=req_realm)
+        except RateLimited as exc:
+            t = time.time() - t_start
+            record_error(model, 429, exc.detail[:200], elapsed_ms=int(t * 1000))
+            return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
@@ -3607,6 +3725,10 @@ class Handler(BaseHTTPRequestHandler):
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account = open_upstream(payload, session_key=session_key, target_realm=req_realm)
+        except RateLimited as exc:
+            record_error(model, 429, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
@@ -3616,6 +3738,8 @@ class Handler(BaseHTTPRequestHandler):
             message = str(exc)
             record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000))
             if message.startswith("no usable account"):
+                # Only a genuinely empty/cooling pool is a 503. A throttled model
+                # is reported as 429 by _rate_limited above instead.
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
